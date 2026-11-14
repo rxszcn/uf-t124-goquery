@@ -808,3 +808,118 @@ func TestIssue26(t *testing.T) {
 		assertLength(t, sel.Nodes, c.l)
 	}
 }
+
+// assertSameNodes fails the test unless got and want contain the same nodes
+// in the same order.
+func assertSameNodes(t *testing.T, got, want []*html.Node) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("Expected %d nodes, got %d.", len(want), len(got))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Node %d differs: want %p, got %p.", i, want[i], got[i])
+		}
+	}
+}
+
+func TestParentsDuplicateSourceNodes(t *testing.T) {
+	// A Selection's Nodes field is exported, so callers can construct a
+	// selection that contains the same node more than once. The ancestors
+	// traversals must still deduplicate so that the shared ancestor chain is
+	// not returned multiple times, and must keep the exact order of the
+	// single-source traversal.
+	base := Doc().Find(".pvk-content")
+	node := base.Nodes[0]
+	single := base.Eq(0)
+	dup := &Selection{Nodes: []*html.Node{node, node, node}, document: base.document}
+
+	assertSameNodes(t, dup.Parents().Nodes, single.Parents().Nodes)
+	assertSameNodes(t, dup.ParentsFiltered("*").Nodes, single.ParentsFiltered("*").Nodes)
+	assertSameNodes(t, dup.ParentsUntil("div").Nodes, single.ParentsUntil("div").Nodes)
+	assertSameNodes(t, dup.ParentsUntilNodes(node.Parent).Nodes, single.ParentsUntilNodes(node.Parent).Nodes)
+}
+
+func TestSiblingsDuplicateSourceNodes(t *testing.T) {
+	// Same deduplication guarantee as TestParentsDuplicateSourceNodes, for
+	// the siblings family of traversals.
+	children := Doc().Find(".pvk-content").Children()
+	node := children.Nodes[1]
+	single := children.Eq(1)
+	dup := &Selection{Nodes: []*html.Node{node, node, node}, document: children.document}
+
+	assertSameNodes(t, dup.Siblings().Nodes, single.Siblings().Nodes)
+	assertSameNodes(t, dup.Next().Nodes, single.Next().Nodes)
+	assertSameNodes(t, dup.NextAll().Nodes, single.NextAll().Nodes)
+	assertSameNodes(t, dup.Prev().Nodes, single.Prev().Nodes)
+	assertSameNodes(t, dup.PrevAll().Nodes, single.PrevAll().Nodes)
+	// An empty until-nodes set never stops the walk, so this must match
+	// NextAll exactly.
+	assertSameNodes(t, dup.NextUntilNodes().Nodes, single.NextUntilNodes().Nodes)
+}
+
+func TestSiblingsOverlappingSourceNodes(t *testing.T) {
+	// Source nodes that are themselves siblings of each other produce
+	// heavily overlapping sibling sets. The merged result must be the
+	// deduplicated union, in the order produced by visiting each source
+	// node in turn (this is the order mapNodes produced historically).
+	children := Doc().Find(".pvk-content").Children()
+	sel := children.Slice(1, 4)
+
+	got := sel.Siblings().Nodes
+	var want []*html.Node
+	set := make(map[*html.Node]bool)
+	for _, n := range sel.Nodes {
+		for c := n.Parent.FirstChild; c != nil; c = c.NextSibling {
+			if c == n || c.Type != html.ElementNode || set[c] {
+				continue
+			}
+			set[c] = true
+			want = append(want, c)
+		}
+	}
+	assertSameNodes(t, got, want)
+}
+
+func TestTraversalAllocsMatchParentFamily(t *testing.T) {
+	// The ancestors and siblings families used to allocate one throwaway
+	// slice per source node via mapNodes, while the single-parent traversal
+	// (Parent) had already been optimized to collect inline with an on-the-fly
+	// dedup set. Both families now use the same inline-collection pattern, so
+	// their allocation counts must be in the same ballpark as Parent's on the
+	// same source selection. The factor allows for the larger result sets
+	// these methods typically build (slice growth is proportional to the
+	// result size, not to the number of source nodes).
+	const maxFactor = 3
+
+	t.Run("ancestors", func(t *testing.T) {
+		sel := DocW().Find("th a")
+		ref := testing.AllocsPerRun(50, func() { sel.Parent() })
+		for name, fn := range map[string]func(){
+			"Parents":      func() { sel.Parents() },
+			"ParentsUntil": func() { sel.ParentsUntil("table") },
+		} {
+			if got := testing.AllocsPerRun(50, fn); got > maxFactor*ref {
+				t.Errorf("%s: %v allocs, want <= %v (%dx Parent's %v)", name, got, maxFactor*ref, maxFactor, ref)
+			}
+		}
+	})
+
+	t.Run("siblings", func(t *testing.T) {
+		sel := DocW().Find("ul li:nth-child(1)")
+		ref := testing.AllocsPerRun(50, func() { sel.Parent() })
+		for name, fn := range map[string]func(){
+			"Siblings": func() { sel.Siblings() },
+			"Next":     func() { sel.Next() },
+			"NextAll":  func() { sel.NextAll() },
+			"PrevAll":  func() { sel.PrevAll() },
+			"NextUntil": func() {
+				sel.NextUntil(":nth-child(4)")
+			},
+		} {
+			if got := testing.AllocsPerRun(50, fn); got > maxFactor*ref {
+				t.Errorf("%s: %v allocs, want <= %v (%dx Parent's %v)", name, got, maxFactor*ref, maxFactor, ref)
+			}
+		}
+	})
+}

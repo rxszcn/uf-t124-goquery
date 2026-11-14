@@ -557,7 +557,17 @@ func findWithMatcher(nodes []*html.Node, m Matcher) []*html.Node {
 // Internal implementation to get all parent nodes, stopping at the specified
 // node (or nil if no stop).
 func getParentsNodes(nodes []*html.Node, stopm Matcher, stopNodes []*html.Node) []*html.Node {
-	return mapNodes(nodes, func(i int, n *html.Node) (result []*html.Node) {
+	// Collect ancestors inline rather than going through mapNodes, which would
+	// allocate a throwaway slice per source node. Ancestor chains of distinct
+	// source nodes converge quickly, so deduplicate as we go, exactly like
+	// getParentNodes does for the single-parent case. The traversal order is
+	// unchanged: source nodes are visited in order, each contributing its
+	// ancestors nearest-first, and a node is appended only the first time it
+	// is seen.
+	var result []*html.Node
+	set := make(map[*html.Node]bool, len(nodes))
+
+	for _, n := range nodes {
 		for p := n.Parent; p != nil; p = p.Parent {
 			if stopm != nil {
 				if stopm.Match(p) {
@@ -568,12 +578,13 @@ func getParentsNodes(nodes []*html.Node, stopm Matcher, stopNodes []*html.Node) 
 					break
 				}
 			}
-			if p.Type == html.ElementNode {
+			if p.Type == html.ElementNode && !set[p] {
+				set[p] = true
 				result = append(result, p)
 			}
 		}
-		return
-	})
+	}
+	return result
 }
 
 // Internal implementation of sibling nodes that return a raw slice of matches.
@@ -593,66 +604,138 @@ func getSiblingNodes(nodes []*html.Node, st siblingType, untilm Matcher, untilNo
 		}
 	}
 
-	return mapNodes(nodes, func(i int, n *html.Node) []*html.Node {
-		return getChildrenWithSiblingType(n.Parent, st, n, f)
-	})
+	// Mirror mapNodes' fast paths: with at most one source node there is
+	// nothing to deduplicate, so collect directly (the single-node case also
+	// keeps the exact-size pre-count inside getChildrenWithSiblingType).
+	switch len(nodes) {
+	case 0:
+		return nil
+	case 1:
+		return getChildrenWithSiblingType(nodes[0].Parent, st, nodes[0], f)
+	}
+
+	// Collect into a single shared slice, deduplicating as we go, instead of
+	// building one throwaway slice per source node via mapNodes. Sibling sets
+	// of distinct source nodes overlap heavily (siblings of siblings share
+	// most of their sibling list), so a set is always used for deduplication,
+	// as in getParentNodes.
+	var result []*html.Node
+	set := make(map[*html.Node]bool, len(nodes))
+	for _, n := range nodes {
+		result = appendChildrenWithSiblingType(result, set, n.Parent, st, n, f)
+	}
+	return result
 }
 
 // Gets the children nodes of each node in the specified slice of nodes,
 // based on the sibling type request.
 func getChildrenNodes(nodes []*html.Node, st siblingType) []*html.Node {
-	return mapNodes(nodes, func(i int, n *html.Node) []*html.Node {
-		return getChildrenWithSiblingType(n, st, nil, nil)
-	})
+	// Same fast paths as getSiblingNodes: with at most one source node there
+	// is nothing to deduplicate.
+	switch len(nodes) {
+	case 0:
+		return nil
+	case 1:
+		return getChildrenWithSiblingType(nodes[0], st, nil, nil)
+	}
+
+	// Collect into a single shared slice, deduplicating as we go, instead of
+	// building one throwaway slice per source node via mapNodes.
+	var result []*html.Node
+	set := make(map[*html.Node]bool, len(nodes))
+	for _, n := range nodes {
+		result = appendChildrenWithSiblingType(result, set, n, st, nil, nil)
+	}
+	return result
+}
+
+// nextSiblingNode advances the sibling walk one step: from cur (nil for the
+// first step) it returns the next node to consider for the requested sibling
+// type, skipping non-element nodes (except for siblingAllIncludingNonElements)
+// and the skipNode. It returns nil when the walk is exhausted. It is a plain
+// function rather than a closure so that the per-parent walks below do not
+// allocate.
+func nextSiblingNode(cur, parent *html.Node, st siblingType, skipNode *html.Node) *html.Node {
+	// Based on the sibling type requested, iterate the right way
+	for {
+		var ret *html.Node
+		switch st {
+		case siblingAll, siblingAllIncludingNonElements:
+			if cur == nil {
+				// First iteration, start with first child of parent
+				// Skip node if required
+				if ret = parent.FirstChild; ret == skipNode && skipNode != nil {
+					ret = skipNode.NextSibling
+				}
+			} else {
+				// Skip node if required
+				if ret = cur.NextSibling; ret == skipNode && skipNode != nil {
+					ret = skipNode.NextSibling
+				}
+			}
+		case siblingPrev, siblingPrevAll, siblingPrevUntil:
+			if cur == nil {
+				// Start with previous sibling of the skip node
+				ret = skipNode.PrevSibling
+			} else {
+				ret = cur.PrevSibling
+			}
+		case siblingNext, siblingNextAll, siblingNextUntil:
+			if cur == nil {
+				// Start with next sibling of the skip node
+				ret = skipNode.NextSibling
+			} else {
+				ret = cur.NextSibling
+			}
+		default:
+			panic("Invalid sibling type.")
+		}
+		if ret == nil || ret.Type == html.ElementNode || st == siblingAllIncludingNonElements {
+			return ret
+		}
+		// Not a valid node, try again from this one
+		cur = ret
+	}
+}
+
+// appendChildrenWithSiblingType appends the children of parent selected by
+// the sibling type st to result and returns the extended slice. When set is
+// non-nil, nodes already in the set are skipped and appended nodes are
+// recorded in it, so callers collecting the children of several parents into
+// one shared slice deduplicate on the fly, without intermediate per-parent
+// slices. The traversal order and the until/single-result semantics are
+// identical to walking each parent separately and merging the per-parent
+// slices with appendWithoutDuplicates.
+func appendChildrenWithSiblingType(result []*html.Node, set map[*html.Node]bool, parent *html.Node, st siblingType,
+	skipNode *html.Node, untilFunc func(*html.Node) bool) []*html.Node {
+
+	for c := nextSiblingNode(nil, parent, st, skipNode); c != nil; c = nextSiblingNode(c, parent, st, skipNode) {
+		// If this is an ...Until case, test before append (returns true
+		// if the until condition is reached)
+		if st == siblingNextUntil || st == siblingPrevUntil {
+			if untilFunc(c) {
+				return result
+			}
+		}
+		if set == nil || !set[c] {
+			if set != nil {
+				set[c] = true
+			}
+			result = append(result, c)
+		}
+		if st == siblingNext || st == siblingPrev {
+			// Only one node was requested (immediate next or previous), so
+			// exit whether or not the candidate was a duplicate
+			return result
+		}
+	}
+	return result
 }
 
 // Gets the children of the specified parent, based on the requested sibling
 // type, skipping a specified node if required.
 func getChildrenWithSiblingType(parent *html.Node, st siblingType, skipNode *html.Node,
 	untilFunc func(*html.Node) bool) (result []*html.Node) {
-
-	// Create the iterator function
-	var iter = func(cur *html.Node) (ret *html.Node) {
-		// Based on the sibling type requested, iterate the right way
-		for {
-			switch st {
-			case siblingAll, siblingAllIncludingNonElements:
-				if cur == nil {
-					// First iteration, start with first child of parent
-					// Skip node if required
-					if ret = parent.FirstChild; ret == skipNode && skipNode != nil {
-						ret = skipNode.NextSibling
-					}
-				} else {
-					// Skip node if required
-					if ret = cur.NextSibling; ret == skipNode && skipNode != nil {
-						ret = skipNode.NextSibling
-					}
-				}
-			case siblingPrev, siblingPrevAll, siblingPrevUntil:
-				if cur == nil {
-					// Start with previous sibling of the skip node
-					ret = skipNode.PrevSibling
-				} else {
-					ret = cur.PrevSibling
-				}
-			case siblingNext, siblingNextAll, siblingNextUntil:
-				if cur == nil {
-					// Start with next sibling of the skip node
-					ret = skipNode.NextSibling
-				} else {
-					ret = cur.NextSibling
-				}
-			default:
-				panic("Invalid sibling type.")
-			}
-			if ret == nil || ret.Type == html.ElementNode || st == siblingAllIncludingNonElements {
-				return
-			}
-			// Not a valid node, try again from this one
-			cur = ret
-		}
-	}
 
 	// For the cases that collect every matching sibling, count them in a
 	// cheap pointer walk first so the result slice can be sized exactly,
@@ -662,27 +745,13 @@ func getChildrenWithSiblingType(parent *html.Node, st siblingType, skipNode *htm
 	switch st {
 	case siblingAll, siblingAllIncludingNonElements, siblingPrevAll, siblingNextAll:
 		n := 0
-		for c := iter(nil); c != nil; c = iter(c) {
+		for c := nextSiblingNode(nil, parent, st, skipNode); c != nil; c = nextSiblingNode(c, parent, st, skipNode) {
 			n++
 		}
 		result = make([]*html.Node, 0, n)
 	}
 
-	for c := iter(nil); c != nil; c = iter(c) {
-		// If this is an ...Until case, test before append (returns true
-		// if the until condition is reached)
-		if st == siblingNextUntil || st == siblingPrevUntil {
-			if untilFunc(c) {
-				return
-			}
-		}
-		result = append(result, c)
-		if st == siblingNext || st == siblingPrev {
-			// Only one node was requested (immediate next or previous), so exit
-			return
-		}
-	}
-	return
+	return appendChildrenWithSiblingType(result, nil, parent, st, skipNode, untilFunc)
 }
 
 // Internal implementation of parent nodes that return a raw slice of Nodes.

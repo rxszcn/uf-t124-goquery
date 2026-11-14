@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/andybalholm/cascadia"
+	"golang.org/x/net/html"
 )
 
 func BenchmarkFind(b *testing.B) {
@@ -817,6 +818,74 @@ func BenchmarkSingleMatcher(b *testing.B) {
 	b.Run("single", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			_ = doc.FindMatcher(single)
+		}
+	})
+}
+
+// repeatFirstNode builds a selection containing the first node of sel
+// repeated n times, to exercise the full-dedup shape of the traversals.
+func repeatFirstNode(sel *Selection, n int) *Selection {
+	nodes := make([]*html.Node, n)
+	for i := range nodes {
+		nodes[i] = sel.Nodes[0]
+	}
+	return &Selection{Nodes: nodes, document: sel.document}
+}
+
+// BenchmarkParentsAllocShapes measures the allocations of the ancestors
+// traversal family across dedup shapes: a single source node (no dedup
+// work), many source nodes whose ancestor chains converge (partial dedup),
+// and a fully duplicated source set (every ancestor deduplicated).
+func BenchmarkParentsAllocShapes(b *testing.B) {
+	single := DocW().Find("#content")
+	shared := DocW().Find("th a")
+	dup := repeatFirstNode(DocW().Find("#content"), 64)
+
+	b.Run("single-source", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			single.Parents()
+		}
+	})
+	b.Run("shared-chains", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			shared.Parents()
+		}
+	})
+	b.Run("full-dedup", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			dup.Parents()
+		}
+	})
+}
+
+// BenchmarkSiblingsAllocShapes measures the allocations of the siblings
+// traversal family across dedup shapes: a single source node (no dedup
+// work), many source nodes with disjoint parents (no duplicates found),
+// and a fully duplicated source set (every sibling deduplicated).
+func BenchmarkSiblingsAllocShapes(b *testing.B) {
+	single := DocW().Find("#content")
+	disjoint := DocW().Find("ul li:nth-child(1)")
+	dup := repeatFirstNode(DocW().Find("ul li:nth-child(1)"), 64)
+
+	b.Run("single-source", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			single.Siblings()
+		}
+	})
+	b.Run("disjoint-sources", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			disjoint.Siblings()
+		}
+	})
+	b.Run("full-dedup", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			dup.Siblings()
 		}
 	})
 }
